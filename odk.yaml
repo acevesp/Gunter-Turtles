@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+  
+  DomainName:
+    Description: Name of the domain used in letsecrypt cert, leave as default (local) if you want to use a self-signed cert.
+    Type: String
+    Default: local
+  
+  ImageID:
+    Description: AMI Id 
+    Type: AWS::EC2::Image::Id
+    Default: ami-04505e74c0741db8d
+  
+  VPCID:
+    Description: Id of the vpc or the default one.
+    Type: AWS::EC2::VPC::Id 
+
+Resources:
+  SesssionManagerInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref SessionManagerRole
+  SessionManagerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+  SessionManagerPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: SessionManager
+      Roles:
+        - !Ref SessionManagerRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ssm:UpdateInstanceInformation'
+              - 'ssmmessages:CreateControlChannel'
+              - 'ssmmessages:CreateDataChannel'
+              - 'ssmmessages:OpenControlChannel'
+              - 'ssmmessages:OpenDataChannel'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - 's3:GetEncryptionConfiguration'
+            Resource: '*'
+        
+  EC2Instance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      IamInstanceProfile: !Ref SesssionManagerInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 20
+            DeleteOnTermination: true
+            Encrypted: false
+      UserData: 
+        Fn::Base64: !Sub |
+              #!/bin/bash -x
+              TOKEN=`curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"`
+              PUB_HOSTNAME=`curl -H "X-aws-ec2-metadata-token: $TOKEN"  http://169.254.169.254/latest/meta-data/public-hostname`
+              apt-get -y remove docker docker-engine docker.io containerd runc
+              apt-get -y update
+              apt-get -y install ca-certificates curl gnupg lsb-release
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              apt-get -y update
+              apt-get -y install docker-ce docker-ce-cli containerd.io
+              curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+              chmod +x /usr/local/bin/docker-compose
+              git clone https://github.com/getodk/central
+              cd central
+              pwd
+              git submodule update -i
+              cp .env.template .env
+              case "${DomainName}"  in
+              local)
+                DOMAIN=local
+                SSL_TYPE=selfsign
+                ;;
+              *)
+                DOMAIN=${DomainName}
+                SSL_TYPE=letsencrypt
+                  ;;
+              esac
+
+              sed -i "s/DOMAIN=your.domain.com/DOMAIN=$DOMAIN/" .env
+              sed -i "s/SSL_TYPE=letsencrypt/SSL_TYPE=$SSL_TYPE/" .env
+              docker-compose build
+              docker-compose up --no-start
+              docker-compose up -d
+
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      ImageId: !Ref ImageID
+  
+  InstanceSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: allow port 80 and 443
+      VpcId: !Ref VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  IPAddress:
+    Type: 'AWS::EC2::EIP'
+  IPAssoc:
+    Type: 'AWS::EC2::EIPAssociation'
+    Properties:
+      InstanceId: !Ref EC2Instance
+      EIP: !Ref IPAddress
+Outputs:
+  InstanceId:
+    Description: InstanceId of the newly created EC2 instance
+    Value: !Ref EC2Instance
+  InstanceIPAddress:
+    Description: IP address of the newly created EC2 instance
+    Value: !Ref IPAddress
